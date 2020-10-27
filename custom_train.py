@@ -68,113 +68,25 @@ if not os.path.exists(args.save_folder):
     os.mkdir(args.save_folder)
 
 
-def train():
-    if args.dataset == 'COCO':
-        if args.dataset_root == VOC_ROOT:
-            if not os.path.exists(COCO_ROOT):
-                parser.error('Must specify dataset_root if specifying dataset')
-            print("WARNING: Using default COCO dataset_root because " +
-                  "--dataset_root was not specified.")
-            args.dataset_root = COCO_ROOT
-        cfg = coco
-        dataset = COCODetection(root=args.dataset_root,
-                                transform=SSDAugmentation(cfg['min_dim'],
-                                                          MEANS))
-    elif args.dataset == 'VOC':
-        if args.dataset_root == COCO_ROOT:
-            parser.error('Must specify dataset if specifying dataset_root')
-        cfg = voc
-        dataset = VOCDetection(root=args.dataset_root,
-                               transform=SSDAugmentation(cfg['min_dim'],
-                                                         MEANS))
+def train(model,train_loader,optimizer,criterion,epoch):
+    
 
-    if args.visdom:
-        import visdom
-        viz = visdom.Visdom()
-
-    ssd_net = build_ssd('train', cfg['min_dim'], cfg['num_classes'])
-    net = ssd_net
-
-    if args.cuda:
-        net = torch.nn.DataParallel(ssd_net)
-        cudnn.benchmark = True
-
-    if args.resume:
-        print('Resuming training, loading {}...'.format(args.resume))
-        ssd_net.load_weights(args.resume)
-    else:
-        vgg_weights = torch.load(args.save_folder + args.basenet)
-        print('Loading base network...')
-        ssd_net.vgg.load_state_dict(vgg_weights)
-
-    if args.cuda:
-        net = net.cuda()
-
-    if not args.resume:
-        print('Initializing weights...')
-        # initialize newly added layers' weights with xavier method
-        ssd_net.extras.apply(weights_init)
-        ssd_net.loc.apply(weights_init)
-        ssd_net.conf.apply(weights_init)
-
-    optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=args.momentum,
-                          weight_decay=args.weight_decay)
-    criterion = MultiBoxLoss(cfg['num_classes'], 0.5, True, 0, True, 3, 0.5,
-                             False, args.cuda)
-
-    net.train()
+    model.train()
     # loss counters
     loc_loss = 0
     conf_loss = 0
-    epoch = 0
     print('Loading the dataset...')
 
-    epoch_size = len(dataset) // args.batch_size
-    print('Training SSD on:', dataset.name)
-    print('Using the specified args:')
-    print(args)
 
     step_index = 0
 
-    if args.visdom:
-        vis_title = 'SSD.PyTorch on ' + dataset.name
-        vis_legend = ['Loc Loss', 'Conf Loss', 'Total Loss']
-        iter_plot = create_vis_plot('Iteration', 'Loss', vis_title, vis_legend)
-        epoch_plot = create_vis_plot('Epoch', 'Loss', vis_title, vis_legend)
-
-    data_loader = data.DataLoader(dataset, args.batch_size,
-                                  num_workers=args.num_workers,
-                                  shuffle=True, collate_fn=detection_collate,
-                                  pin_memory=True)
     # create batch iterator
-    batch_iterator = iter(data_loader)
-    print(len(batch_iterator))
-    min_loss = 1000000
-    num = 0
-    epoch = 1
-    for iteration in range(args.start_iter, cfg['max_iter']):
-        if args.visdom and iteration != 0 and (iteration % epoch_size == 0):
-            update_vis_plot(epoch, loc_loss, conf_loss, epoch_plot, None,
-                            'append', epoch_size)
-            # reset epoch loss counters
-            loc_loss = 0
-            conf_loss = 0
-            epoch += 1
-
-        if iteration in cfg['lr_steps'] or num==200:
-            step_index += 1
-            adjust_learning_rate(optimizer, args.gamma, step_index)
-            #num = 0
-            #print("adjusting lr")
+    for i, data in enumerate(train_loader):
+        
 
         # load train data
-        try:
-            images, targets = next(batch_iterator)
-        except StopIteration:
-            batch_iterator = iter(data_loader)
-            print(len(batch_iterator))
-            images,targets = next(batch_iterator)
-            epoch+=1
+        images, targets = data
+
         if args.cuda:
             images = Variable(images.cuda())
             targets = [Variable(ann.cuda(), volatile=True) for ann in targets]
@@ -183,7 +95,7 @@ def train():
             targets = [Variable(ann, volatile=True) for ann in targets]
         # forward
         t0 = time.time()
-        out = net(images)
+        out = model(images)
         # backprop
         optimizer.zero_grad()
         loss_l, loss_c = criterion(out, targets)
@@ -195,35 +107,60 @@ def train():
         #conf_loss += loss_c.data[0]
         loc_loss += loss_l.item()
         conf_loss += loss_c.item()
-        
-        
-        #if loss.item()<min_loss:
-        #    min_loss = loss.item()
-        #    num = 0
-        #else:
-        #    num+=1
-        
 
-        if iteration % 10 == 0:
+        if i % 10 == 0:
             print('timer: %.4f sec.' % (t1 - t0))
-            print('epoch '+ str(epoch) + ' iter ' + repr(iteration) + ' || Loss: %.4f ||' % (loss.item()), end=' ')
+            print('epoch '+ str(epoch) + ' || ' + 'iter ' + str(i) + ' || Loss: %.4f ||' % (loss.item()), end=' ')
+    
+    del images,targets
 
-        if args.visdom:
-            update_vis_plot(iteration, loss_l.item(), loss_c.item(),
-                            iter_plot, epoch_plot, 'append')
+    torch.cuda.empty_cache()
+    return loss.item()
 
-        if iteration != 0 and iteration % 5000 == 0:
-            print('Saving state, iter:', iteration)
-            torch.save(ssd_net.state_dict(), 'weights/ssd300_COCO_' +
-                       repr(iteration) + '.pth')
+def eval_(model,train_loader,optimizer,criterion,epoch):
+    
 
-        if loss.item()<min_loss:
-            min_loss = loss.item()
-            torch.save(ssd_net.state_dict(),'weights/ssd300_COCO_best.pth')
-    torch.save(ssd_net.state_dict(),
-               args.save_folder + '' + args.dataset + '.pth')
+    model.eval()
+    # loss counters
+    loc_loss = 0
+    conf_loss = 0
+    print('Loading the dataset...')
 
 
+    step_index = 0
+
+    # create batch iterator
+    with torch.no_grad():
+        for i, data in enumerate(train_loader):
+            
+            # load train data
+            images, targets = data
+
+            if args.cuda:
+                images = Variable(images.cuda())
+                targets = [Variable(ann.cuda(), volatile=True) for ann in targets]
+            else:
+                images = Variable(images)
+                targets = [Variable(ann, volatile=True) for ann in targets]
+            # forward
+            t0 = time.time()
+            out = model(images)
+            # backprop
+            loss_l, loss_c = criterion(out, targets)
+            loss = loss_l + loss_c
+            
+           
+            t1 = time.time()
+            #loc_loss += loss_l.data[0]
+            #conf_loss += loss_c.data[0]
+            loc_loss += loss_l.item()
+            conf_loss += loss_c.item()
+        del images,targets
+
+    print('epoch '+str(epoch) +'|| '+'val loss '+ str(loss.item()) )
+
+    torch.cuda.empty_cache()
+    return loss.item()
 
 def adjust_learning_rate(optimizer, gamma, step):
     """Sets the learning rate to the initial LR decayed by 10 at every
@@ -278,4 +215,79 @@ def update_vis_plot(iteration, loc, conf, window1, window2, update_type,
 
 
 if __name__ == '__main__':
-    train()
+    if args.dataset == 'COCO':
+        if args.dataset_root == VOC_ROOT:
+            if not os.path.exists(COCO_ROOT):
+                parser.error('Must specify dataset_root if specifying dataset')
+            print("WARNING: Using default COCO dataset_root because " +
+                  "--dataset_root was not specified.")
+            args.dataset_root = COCO_ROOT
+        cfg = coco
+        train_dataset = COCODetection(root=args.dataset_root,image_set='train2014',
+                                transform=SSDAugmentation(cfg['min_dim'],
+                                                          MEANS))
+        eval_dataset = COCODetection(root=args.dataset_root,image_set='val2014',
+                                transform=SSDAugmentation(cfg['min_dim'],
+                                                          MEANS))
+    elif args.dataset == 'VOC':
+        if args.dataset_root == COCO_ROOT:
+            parser.error('Must specify dataset if specifying dataset_root')
+        cfg = voc
+        dataset = VOCDetection(root=args.dataset_root,
+                               transform=SSDAugmentation(cfg['min_dim'],
+                                                         MEANS))
+
+    if args.visdom:
+        import visdom
+        viz = visdom.Visdom()
+
+    ssd_net = build_ssd('train', cfg['min_dim'], cfg['num_classes'])
+    net = ssd_net
+
+    if args.cuda:
+        net = torch.nn.DataParallel(ssd_net)
+        cudnn.benchmark = True
+
+    if args.resume:
+        print('Resuming training, loading {}...'.format(args.resume))
+        ssd_net.load_weights(args.resume)
+    else:
+        vgg_weights = torch.load(args.save_folder + args.basenet)
+        print('Loading base network...')
+        ssd_net.vgg.load_state_dict(vgg_weights)
+
+    if args.cuda:
+        net = net.cuda()
+
+    if not args.resume:
+        print('Initializing weights...')
+        # initialize newly added layers' weights with xavier method
+        ssd_net.extras.apply(weights_init)
+        ssd_net.loc.apply(weights_init)
+        ssd_net.conf.apply(weights_init)
+
+    optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=args.momentum,
+                          weight_decay=args.weight_decay)
+    criterion = MultiBoxLoss(cfg['num_classes'], 0.5, True, 0, True, 3, 0.5,
+                             False, args.cuda)
+    train_loader = data.DataLoader(train_dataset, args.batch_size,
+                                  num_workers=args.num_workers,
+                                  shuffle=True, collate_fn=detection_collate,
+                                  pin_memory=True)
+
+    eval_loader = data.DataLoader(eval_dataset, args.batch_size,
+                                  num_workers=args.num_workers,
+                                  shuffle=False, collate_fn=detection_collate,
+                                  pin_memory=True)
+    epoch = 10000
+    min_loss = 1000000
+    for i in range(1,epoch):
+        train_loss = train(net,train_loader,optimizer,criterion,i)
+        val_loss = eval_(net,eval_loader,optimizer,criterion,i)
+        print('epoch :' + str(i) + 'train_loss :'+ str(train_loss)+ 'val loss: '+ str(val_loss))
+        
+        torch.save(ssd_net.state_dict(), 'weights/ssd300_COCO_'+str(i)+'_'+str(val_loss)+'.pth')
+        if val_loss < min_loss:
+            min_loss = val_loss
+            torch.save(ssd_net.state_dict(), 'weights/ssd300_COCO_best.pth')
+            print('best!')
